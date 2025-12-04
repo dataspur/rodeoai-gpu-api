@@ -2,9 +2,10 @@ import os
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import json
+from lovable_client import get_lovable_client
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +43,21 @@ class HealthResponse(BaseModel):
     model_version: str = "l40s-v1.0.0"
     timestamp: str
 
+class GenerateAndPushRequest(BaseModel):
+    event_name: str
+    event_location: str
+    event_date: str  # ISO format, e.g., "2024-12-15T19:00:00Z"
+    event_type: str  # bull_riding, saddle_bronc, bareback, barrel_racing, etc.
+    rider_name: str
+    rider_rank: Optional[int] = None
+    rider_stats: Optional[Dict[str, Any]] = None
+    animal_stats: Optional[Dict[str, Any]] = None
+
+class GenerateAndPushResponse(BaseModel):
+    prediction: PredictionResponse
+    lovable_response: Dict[str, Any]
+    status: str
+
 @app.get("/", response_model=Dict[str, str])
 async def root():
     """Root endpoint with API information"""
@@ -61,6 +77,97 @@ async def health_check():
         model_version="l40s-v1.0.0",
         timestamp=datetime.now().isoformat()
     )
+
+@app.post("/generate-and-push", response_model=GenerateAndPushResponse)
+async def generate_and_push(
+    request: GenerateAndPushRequest,
+    x_api_key: Optional[str] = Header(None)
+):
+    """
+    Generate a prediction using GPU and automatically push to Lovable RodeoAI
+
+    This endpoint:
+    1. Generates a prediction based on provided stats
+    2. Pushes the prediction to Lovable's ingest-prediction endpoint
+    3. Returns both the prediction and Lovable's response
+    """
+    # Check API key if configured
+    if GPU_API_KEY and x_api_key != GPU_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        logger.info(f"Generating and pushing prediction for {request.event_name} - {request.rider_name}")
+
+        # Generate prediction using GPU logic
+        score = 0.5
+        if request.rider_stats:
+            if "wins" in request.rider_stats:
+                score += min(0.2, request.rider_stats["wins"] / 100)
+            if "average_score" in request.rider_stats:
+                score += min(0.2, request.rider_stats["average_score"] / 100)
+            if "win_rate" in request.rider_stats:
+                score += min(0.15, request.rider_stats["win_rate"] / 100)
+
+        if request.animal_stats:
+            if "buck_score" in request.animal_stats:
+                score -= min(0.1, request.animal_stats["buck_score"] / 100)
+
+        score = max(0.0, min(1.0, score))
+        confidence = min(95.0, score * 100 + 10)  # Convert to percentage
+
+        # Calculate odds (simplified)
+        if score > 0.7:
+            odds = 200 + (score * 100)
+        else:
+            odds = 300 + (score * 150)
+
+        # Generate analysis text
+        win_rate = request.rider_stats.get("win_rate", 0) if request.rider_stats else 0
+        analysis = f"Based on {request.rider_name}'s performance statistics "
+        if win_rate > 0:
+            analysis += f"with a {win_rate:.1f}% win rate, "
+        analysis += f"the model predicts a {confidence:.1f}% chance of success in this {request.event_type} event."
+
+        prediction = PredictionResponse(
+            prediction_score=score,
+            confidence=confidence / 100,  # Normalize back to 0-1
+            factors={
+                "rider_experience": 0.35,
+                "recent_performance": 0.25,
+                "event_conditions": 0.20,
+                "historical_matchup": 0.20
+            },
+            timestamp=datetime.now().isoformat(),
+            model_version="l40s-v1.0.0"
+        )
+
+        # Push to Lovable
+        lovable_client = get_lovable_client()
+        lovable_response = await lovable_client.push_prediction(
+            event_name=request.event_name,
+            event_location=request.event_location,
+            event_date=request.event_date,
+            event_type=request.event_type,
+            rider_name=request.rider_name,
+            rider_rank=request.rider_rank,
+            rider_win_rate=win_rate if win_rate > 0 else None,
+            prediction_type="winner",
+            predicted_value="Win" if score > 0.5 else "Unlikely",
+            confidence=confidence,
+            odds=odds,
+            model_version="l40s-v1.0.0",
+            analysis=analysis
+        )
+
+        return GenerateAndPushResponse(
+            prediction=prediction,
+            lovable_response=lovable_response,
+            status="success"
+        )
+
+    except Exception as e:
+        logger.error(f"Error in generate-and-push: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(
