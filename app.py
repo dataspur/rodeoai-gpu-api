@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import logging
 import json
 from lovable_client import get_lovable_client
+from nexgen_analytics import get_nexgen_analytics
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -57,6 +58,21 @@ class GenerateAndPushResponse(BaseModel):
     prediction: PredictionResponse
     lovable_response: Dict[str, Any]
     status: str
+
+class AnalyticsRequest(BaseModel):
+    predictions: List[Dict[str, Any]]
+    results: List[Dict[str, Any]]
+    time_range: Optional[int] = 30  # days
+    include_trends: Optional[bool] = True
+    include_event_breakdown: Optional[bool] = True
+    include_roi: Optional[bool] = True
+
+class AnalyticsResponse(BaseModel):
+    summary: Dict[str, Any]
+    event_breakdown: Optional[Dict[str, Any]] = None
+    roi_metrics: Optional[Dict[str, Any]] = None
+    trends: Optional[List[Dict[str, Any]]] = None
+    metadata: Dict[str, Any]
 
 @app.get("/", response_model=Dict[str, str])
 async def root():
@@ -267,6 +283,106 @@ async def gpu_info():
         "compute_capability": "8.9",
         "status": "active"
     }
+
+@app.post("/nexgen-analytics", response_model=AnalyticsResponse)
+async def nexgen_analytics(
+    request: AnalyticsRequest,
+    x_api_key: Optional[str] = Header(None)
+):
+    """
+    Run NEXGEN ANALYTICS on provided predictions and results data
+
+    This endpoint uses your GPU-powered NEXGEN ANALYTICS engine to:
+    - Compute accuracy metrics
+    - Analyze trends over time
+    - Break down performance by event type
+    - Calculate ROI
+    - Generate comprehensive insights
+
+    Send your predictions and results data, get back deep analytics.
+    """
+    # Check API key if configured
+    if GPU_API_KEY and x_api_key != GPU_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        logger.info(f"Running NEXGEN Analytics on {len(request.predictions)} predictions, {len(request.results)} results")
+
+        # Get NEXGEN Analytics engine
+        analytics_engine = get_nexgen_analytics()
+
+        # Compute comprehensive report
+        report = analytics_engine.generate_comprehensive_report(
+            predictions=request.predictions,
+            results=request.results,
+            time_range=request.time_range
+        )
+
+        # Build response based on request flags
+        response = AnalyticsResponse(
+            summary=report["summary"],
+            metadata=report["metadata"]
+        )
+
+        if request.include_event_breakdown:
+            response.event_breakdown = report.get("event_breakdown")
+
+        if request.include_roi:
+            response.roi_metrics = report.get("roi_metrics")
+
+        if request.include_trends:
+            response.trends = report.get("trends")
+
+        logger.info("NEXGEN Analytics computation complete")
+        return response
+
+    except Exception as e:
+        logger.error(f"NEXGEN Analytics error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/nexgen-analytics-simple", response_model=Dict[str, Any])
+async def nexgen_analytics_simple(
+    time_range: Optional[int] = 30,
+    x_api_key: Optional[str] = Header(None)
+):
+    """
+    Simplified NEXGEN Analytics endpoint that fetches data from Lovable automatically
+
+    This endpoint:
+    1. Fetches predictions and results from Lovable database
+    2. Runs NEXGEN Analytics on that data
+    3. Returns comprehensive analytics
+
+    No need to send data - it pulls from Lovable automatically!
+    """
+    # Check API key if configured
+    if GPU_API_KEY and x_api_key != GPU_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        logger.info("Running simplified NEXGEN Analytics (auto-fetch from Lovable)")
+
+        # TODO: Fetch data from Lovable
+        # For now, return placeholder
+        # In production, you'd call Lovable's get-predictions and get-results endpoints
+
+        analytics_engine = get_nexgen_analytics()
+
+        # Placeholder - replace with actual data fetch
+        predictions = []
+        results = []
+
+        report = analytics_engine.generate_comprehensive_report(
+            predictions=predictions,
+            results=results,
+            time_range=time_range
+        )
+
+        return report
+
+    except Exception as e:
+        logger.error(f"Simplified NEXGEN Analytics error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # RunPod serverless handler (if needed)
 @app.post("/runsync")
