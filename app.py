@@ -8,6 +8,11 @@ import json
 from lovable_client import get_lovable_client
 from nexgen_analytics import get_nexgen_analytics
 from data_processor import get_data_processor
+from deduplication import (
+    get_deduplication_engine,
+    get_triage_engine,
+    get_review_queue
+)
 from fastapi import File, UploadFile
 
 # Configure logging
@@ -390,26 +395,32 @@ async def nexgen_analytics_simple(
 async def ingest_historical_data(
     file: UploadFile = File(...),
     auto_push: bool = True,
+    skip_deduplication: bool = False,
+    skip_triage: bool = False,
     x_api_key: Optional[str] = Header(None)
 ):
     """
-    Ingest historical rodeo data from uploaded files
+    Ingest historical rodeo data from uploaded files with smart deduplication and triage
 
     This endpoint:
-    1. Accepts file upload (PDF, CSV, Excel, image, text)
-    2. Extracts text and data using GPU
-    3. Formats data for Lovable schema
-    4. Optionally auto-pushes to Lovable database
+    1. Checks for duplicate files (exact and semantic)
+    2. Quickly triages file relevance
+    3. Extracts text and data using GPU
+    4. Assesses data quality
+    5. Routes to review queue if needed
+    6. Optionally auto-pushes to Lovable database
 
     Supported formats: .pdf, .csv, .xlsx, .txt, .jpg, .png
 
     Args:
         file: Uploaded file
         auto_push: If True, automatically push to Lovable after processing
+        skip_deduplication: Skip deduplication checks (for re-uploads)
+        skip_triage: Skip triage checks (force process everything)
         x_api_key: API key for authentication
 
     Returns:
-        Processing results and ingestion status
+        Processing results with deduplication and triage status
     """
     # Check API key if configured
     if GPU_API_KEY and x_api_key != GPU_API_KEY:
@@ -422,7 +433,58 @@ async def ingest_historical_data(
         content = await file.read()
         logger.info(f"File size: {len(content)} bytes")
 
-        # Process file
+        # STEP 1: Check for duplicate file
+        dedup_result = {"is_duplicate": False}
+        if not skip_deduplication:
+            dedup_engine = get_deduplication_engine()
+            dedup_result = dedup_engine.check_file_duplicate(content, file.filename)
+
+            if dedup_result["is_duplicate"]:
+                logger.warning(f"DUPLICATE FILE DETECTED: {file.filename}")
+                return {
+                    "status": "duplicate",
+                    "filename": file.filename,
+                    "file_size": len(content),
+                    "duplicate_check": dedup_result,
+                    "message": "This file was already uploaded. Use skip_deduplication=true to force re-upload.",
+                    "action": "rejected"
+                }
+
+        # STEP 2: Smart triage - Quick relevance check
+        triage_result = {"verdict": "relevant", "action": "process"}
+        if not skip_triage:
+            triage_engine = get_triage_engine()
+            triage_result = triage_engine.assess_file_relevance(
+                filename=file.filename,
+                content=content,
+                file_type=file.content_type or ''
+            )
+
+            logger.info(f"Triage verdict: {triage_result['verdict']} (score: {triage_result['relevance_score']})")
+
+            # If irrelevant, reject immediately
+            if triage_result["action"] == "reject":
+                logger.warning(f"IRRELEVANT FILE: {file.filename}")
+
+                review_queue = get_review_queue()
+                review_queue.add_to_review(
+                    filename=file.filename,
+                    reason="File appears irrelevant to rodeo data",
+                    file_hash=dedup_result.get("hash", "unknown"),
+                    assessment=triage_result
+                )
+
+                return {
+                    "status": "rejected",
+                    "filename": file.filename,
+                    "file_size": len(content),
+                    "triage": triage_result,
+                    "message": "File does not appear to contain rodeo data. Sent to review queue.",
+                    "action": "rejected",
+                    "review_queue_id": len(get_review_queue().queue) - 1
+                }
+
+        # STEP 3: Process file (extract data)
         processor = get_data_processor()
         processed_data = processor.process_file(
             file_content=content,
@@ -432,9 +494,66 @@ async def ingest_historical_data(
 
         logger.info(f"Processed data: {processed_data.keys()}")
 
-        # Auto-push to Lovable if enabled
+        # STEP 4: Check for semantic data duplication
+        data_dedup_result = {"is_duplicate": False}
+        if not skip_deduplication and not dedup_result["is_duplicate"]:
+            data_dedup_result = dedup_engine.check_data_duplicate(processed_data, file.filename)
+
+            if data_dedup_result["is_duplicate"]:
+                logger.warning(f"DUPLICATE DATA DETECTED: {file.filename}")
+                return {
+                    "status": "duplicate",
+                    "filename": file.filename,
+                    "file_size": len(content),
+                    "duplicate_check": data_dedup_result,
+                    "message": "This data was already uploaded (possibly in different format)",
+                    "action": "rejected"
+                }
+
+        # STEP 5: Assess data quality
+        quality_result = {"verdict": "good", "action": "process"}
+        if not skip_triage:
+            quality_result = triage_engine.assess_data_quality(processed_data, file.filename)
+
+            logger.info(f"Quality verdict: {quality_result['verdict']} (score: {quality_result['quality_score']})")
+
+            # If poor quality, route to review
+            if quality_result["action"] == "reject":
+                logger.warning(f"POOR QUALITY DATA: {file.filename}")
+
+                review_queue = get_review_queue()
+                review_queue.add_to_review(
+                    filename=file.filename,
+                    reason="Poor data quality",
+                    file_hash=dedup_result.get("hash", "unknown"),
+                    assessment=quality_result
+                )
+
+                return {
+                    "status": "rejected",
+                    "filename": file.filename,
+                    "file_size": len(content),
+                    "quality_assessment": quality_result,
+                    "message": "Data quality too low. Sent to review queue.",
+                    "action": "rejected",
+                    "review_queue_id": len(get_review_queue().queue) - 1
+                }
+
+            # If needs review, route to review queue but don't reject
+            if quality_result["action"] == "review" or triage_result.get("action") == "review":
+                logger.info(f"NEEDS REVIEW: {file.filename}")
+
+                review_queue = get_review_queue()
+                review_queue.add_to_review(
+                    filename=file.filename,
+                    reason="Uncertain quality or relevance - needs manual review",
+                    file_hash=dedup_result.get("hash", "unknown"),
+                    assessment={**triage_result, **quality_result}
+                )
+
+        # STEP 6: Auto-push to Lovable if enabled and passed all checks
         push_results = []
-        if auto_push:
+        if auto_push and quality_result["action"] == "process":
             logger.info("Auto-pushing processed data to Lovable")
             lovable_client = get_lovable_client()
 
@@ -458,10 +577,33 @@ async def ingest_historical_data(
                         logger.error(f"Error pushing result: {str(e)}")
                         push_results.append({"type": "result", "status": "error", "error": str(e)})
 
+        # Determine final status
+        if quality_result["action"] == "review" or triage_result.get("action") == "review":
+            final_status = "needs_review"
+        elif quality_result["action"] == "process" and auto_push:
+            final_status = "success"
+        else:
+            final_status = "processed"
+
         return {
-            "status": "success",
+            "status": final_status,
             "filename": file.filename,
             "file_size": len(content),
+            "deduplication": {
+                "file_duplicate": dedup_result["is_duplicate"],
+                "data_duplicate": data_dedup_result["is_duplicate"]
+            },
+            "triage": {
+                "verdict": triage_result["verdict"],
+                "confidence": triage_result.get("confidence", 0),
+                "reasons": triage_result.get("reasons", [])
+            },
+            "quality": {
+                "verdict": quality_result["verdict"],
+                "score": quality_result.get("quality_score", 0),
+                "issues": quality_result.get("issues", []),
+                "warnings": quality_result.get("warnings", [])
+            },
             "processed_data": {
                 "events_count": len(processed_data.get("events", [])),
                 "riders_count": len(processed_data.get("riders", [])),
@@ -470,8 +612,8 @@ async def ingest_historical_data(
             },
             "auto_push_enabled": auto_push,
             "push_results": push_results if auto_push else None,
-            "needs_review": processed_data.get("needs_review", False),
-            "needs_manual_mapping": processed_data.get("needs_manual_mapping", False)
+            "action_taken": quality_result["action"],
+            "review_queue_id": len(get_review_queue().queue) - 1 if final_status == "needs_review" else None
         }
 
     except Exception as e:
@@ -550,6 +692,39 @@ async def ingest_batch(
 
     except Exception as e:
         logger.error(f"Error in batch ingestion: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/review-queue", response_model=Dict[str, Any])
+async def get_review_queue_endpoint(
+    x_api_key: Optional[str] = Header(None)
+):
+    """
+    Get all files in the review queue
+
+    Files end up in the review queue if:
+    - They appear irrelevant to rodeo data
+    - Data quality is too low
+    - Extraction confidence is low
+    - File structure is unclear
+
+    Returns list of files needing manual review.
+    """
+    # Check API key if configured
+    if GPU_API_KEY and x_api_key != GPU_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        review_queue = get_review_queue()
+        queue_items = review_queue.get_review_queue()
+
+        return {
+            "status": "success",
+            "queue_length": len(queue_items),
+            "items": queue_items
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching review queue: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # RunPod serverless handler (if needed)
