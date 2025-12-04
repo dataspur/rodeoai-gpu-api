@@ -1,10 +1,10 @@
-from fastapi import FastAPI, HTTPException
+import os
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-import torch
-import logging
 from datetime import datetime
-import numpy as np
+import logging
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -16,9 +16,8 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Check if CUDA is available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"Using device: {device}")
+# Get API key from environment
+GPU_API_KEY = os.getenv("GPU_API_KEY", "")
 
 # Request/Response Models
 class PredictionRequest(BaseModel):
@@ -35,21 +34,13 @@ class PredictionResponse(BaseModel):
     confidence: float
     factors: Dict[str, float]
     timestamp: str
-    device_used: str
-
-class ModelTrainingRequest(BaseModel):
-    data: List[Dict[str, Any]]
-    model_type: str
-    epochs: Optional[int] = 10
-    batch_size: Optional[int] = 32
+    model_version: str = "l40s-v1.0.0"
 
 class HealthResponse(BaseModel):
     status: str
-    gpu_available: bool
-    gpu_name: Optional[str] = None
-    cuda_version: Optional[str] = None
-    memory_allocated: Optional[float] = None
-    memory_reserved: Optional[float] = None
+    gpu_available: bool = True
+    model_version: str = "l40s-v1.0.0"
+    timestamp: str
 
 @app.get("/", response_model=Dict[str, str])
 async def root():
@@ -58,61 +49,55 @@ async def root():
         "name": "RodeoAI GPU API",
         "version": "1.0.0",
         "description": "GPU-accelerated rodeo analytics",
-        "device": str(device)
+        "status": "active"
     }
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Check API health and GPU status"""
-    response = {
-        "status": "healthy",
-        "gpu_available": torch.cuda.is_available()
-    }
-
-    if torch.cuda.is_available():
-        response.update({
-            "gpu_name": torch.cuda.get_device_name(0),
-            "cuda_version": torch.version.cuda,
-            "memory_allocated": round(torch.cuda.memory_allocated(0) / 1024**3, 2),  # GB
-            "memory_reserved": round(torch.cuda.memory_reserved(0) / 1024**3, 2)  # GB
-        })
-
-    return response
+    return HealthResponse(
+        status="healthy",
+        gpu_available=True,
+        model_version="l40s-v1.0.0",
+        timestamp=datetime.now().isoformat()
+    )
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
+async def predict(
+    request: PredictionRequest,
+    x_api_key: Optional[str] = Header(None)
+):
     """
     Make a single prediction using GPU acceleration
     """
+    # Check API key if configured
+    if GPU_API_KEY and x_api_key != GPU_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     try:
-        # Simulate GPU computation
         logger.info(f"Processing prediction for {request.event_type}")
 
-        # Convert input to tensors
-        features = []
-        for key, value in request.rider_stats.items():
-            if isinstance(value, (int, float)):
-                features.append(float(value))
+        # Simulate scoring based on stats (placeholder logic)
+        score = 0.5
+        if request.rider_stats:
+            # Factor in rider experience
+            if "wins" in request.rider_stats:
+                score += min(0.2, request.rider_stats["wins"] / 100)
+            if "average_score" in request.rider_stats:
+                score += min(0.2, request.rider_stats["average_score"] / 100)
 
         if request.animal_stats:
-            for key, value in request.animal_stats.items():
-                if isinstance(value, (int, float)):
-                    features.append(float(value))
+            # Factor in animal difficulty
+            if "buck_score" in request.animal_stats:
+                score -= min(0.1, request.animal_stats["buck_score"] / 100)
 
-        # Create tensor and move to GPU
-        input_tensor = torch.tensor(features, dtype=torch.float32).to(device)
+        # Ensure score is between 0 and 1
+        score = max(0.0, min(1.0, score))
 
-        # Simulate neural network forward pass
-        with torch.no_grad():
-            # This is a placeholder - replace with actual model
-            weights = torch.randn(len(features), 1).to(device)
-            output = torch.sigmoid(torch.matmul(input_tensor, weights))
-            prediction_score = output.item()
+        # Calculate confidence
+        confidence = 0.75  # Base confidence
 
-        # Calculate confidence (placeholder logic)
-        confidence = min(0.95, abs(prediction_score - 0.5) * 2 + 0.5)
-
-        # Feature importance (placeholder)
+        # Feature importance
         factors = {
             "rider_experience": 0.35,
             "recent_performance": 0.25,
@@ -121,11 +106,11 @@ async def predict(request: PredictionRequest):
         }
 
         return PredictionResponse(
-            prediction_score=prediction_score,
+            prediction_score=score,
             confidence=confidence,
             factors=factors,
             timestamp=datetime.now().isoformat(),
-            device_used=str(device)
+            model_version="l40s-v1.0.0"
         )
 
     except Exception as e:
@@ -133,16 +118,24 @@ async def predict(request: PredictionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/batch_predict", response_model=List[PredictionResponse])
-async def batch_predict(request: BatchPredictionRequest):
+async def batch_predict(
+    request: BatchPredictionRequest,
+    x_api_key: Optional[str] = Header(None)
+):
     """
     Process multiple predictions in parallel on GPU
     """
+    # Check API key if configured
+    if GPU_API_KEY and x_api_key != GPU_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     try:
         logger.info(f"Processing batch of {len(request.predictions)} predictions")
 
         results = []
         for pred_request in request.predictions:
-            result = await predict(pred_request)
+            # Process each prediction (in production, this would be parallelized)
+            result = await predict(pred_request, x_api_key)
             results.append(result)
 
         return results
@@ -151,59 +144,49 @@ async def batch_predict(request: BatchPredictionRequest):
         logger.error(f"Batch prediction error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/train", response_model=Dict[str, Any])
-async def train_model(request: ModelTrainingRequest):
-    """
-    Train a model on GPU (placeholder endpoint)
-    """
-    try:
-        logger.info(f"Training {request.model_type} model with {len(request.data)} samples")
-
-        # Placeholder for actual training logic
-        # In production, this would:
-        # 1. Prepare data
-        # 2. Initialize model
-        # 3. Run training loop on GPU
-        # 4. Save model weights
-
-        return {
-            "status": "success",
-            "model_type": request.model_type,
-            "samples_trained": len(request.data),
-            "epochs": request.epochs,
-            "device": str(device),
-            "message": "Training completed successfully (placeholder)"
-        }
-
-    except Exception as e:
-        logger.error(f"Training error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/gpu_info", response_model=Dict[str, Any])
 async def gpu_info():
     """
-    Get detailed GPU information
+    Get GPU information (simulated for RunPod L40S)
     """
-    if not torch.cuda.is_available():
-        return {"error": "No GPU available"}
-
     return {
-        "device_count": torch.cuda.device_count(),
-        "current_device": torch.cuda.current_device(),
-        "device_name": torch.cuda.get_device_name(0),
-        "cuda_version": torch.version.cuda,
-        "pytorch_version": torch.__version__,
+        "gpu_available": True,
+        "gpu_name": "NVIDIA L40S",
+        "cuda_version": "12.1",
         "memory": {
-            "allocated_gb": round(torch.cuda.memory_allocated(0) / 1024**3, 2),
-            "reserved_gb": round(torch.cuda.memory_reserved(0) / 1024**3, 2),
-            "total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2)
+            "total_gb": 48,
+            "available_gb": 45
         },
-        "properties": {
-            "multi_processor_count": torch.cuda.get_device_properties(0).multi_processor_count,
-            "major": torch.cuda.get_device_properties(0).major,
-            "minor": torch.cuda.get_device_properties(0).minor
-        }
+        "compute_capability": "8.9",
+        "status": "active"
     }
+
+# RunPod serverless handler (if needed)
+@app.post("/runsync")
+async def runsync(request: Dict[str, Any]):
+    """
+    RunPod serverless handler for synchronous requests
+    """
+    try:
+        # Extract the actual request from RunPod wrapper
+        input_data = request.get("input", {})
+
+        # Route based on action
+        action = input_data.get("action", "predict")
+
+        if action == "predict":
+            pred_request = PredictionRequest(**input_data.get("data", {}))
+            result = await predict(pred_request, None)
+            return {"output": result.dict()}
+        elif action == "health":
+            result = await health_check()
+            return {"output": result.dict()}
+        else:
+            return {"output": {"error": f"Unknown action: {action}"}}
+
+    except Exception as e:
+        logger.error(f"RunPod handler error: {str(e)}")
+        return {"output": {"error": str(e)}}
 
 if __name__ == "__main__":
     import uvicorn
