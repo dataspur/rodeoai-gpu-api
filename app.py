@@ -7,6 +7,8 @@ import logging
 import json
 from lovable_client import get_lovable_client
 from nexgen_analytics import get_nexgen_analytics
+from data_processor import get_data_processor
+from fastapi import File, UploadFile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -382,6 +384,172 @@ async def nexgen_analytics_simple(
 
     except Exception as e:
         logger.error(f"Simplified NEXGEN Analytics error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ingest-historical-data", response_model=Dict[str, Any])
+async def ingest_historical_data(
+    file: UploadFile = File(...),
+    auto_push: bool = True,
+    x_api_key: Optional[str] = Header(None)
+):
+    """
+    Ingest historical rodeo data from uploaded files
+
+    This endpoint:
+    1. Accepts file upload (PDF, CSV, Excel, image, text)
+    2. Extracts text and data using GPU
+    3. Formats data for Lovable schema
+    4. Optionally auto-pushes to Lovable database
+
+    Supported formats: .pdf, .csv, .xlsx, .txt, .jpg, .png
+
+    Args:
+        file: Uploaded file
+        auto_push: If True, automatically push to Lovable after processing
+        x_api_key: API key for authentication
+
+    Returns:
+        Processing results and ingestion status
+    """
+    # Check API key if configured
+    if GPU_API_KEY and x_api_key != GPU_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        logger.info(f"Ingesting historical data from: {file.filename}")
+
+        # Read file content
+        content = await file.read()
+        logger.info(f"File size: {len(content)} bytes")
+
+        # Process file
+        processor = get_data_processor()
+        processed_data = processor.process_file(
+            file_content=content,
+            filename=file.filename,
+            file_type=file.content_type or ''
+        )
+
+        logger.info(f"Processed data: {processed_data.keys()}")
+
+        # Auto-push to Lovable if enabled
+        push_results = []
+        if auto_push:
+            logger.info("Auto-pushing processed data to Lovable")
+            lovable_client = get_lovable_client()
+
+            # Push predictions
+            if "predictions" in processed_data:
+                for pred in processed_data["predictions"]:
+                    try:
+                        result = await lovable_client.push_prediction(**pred)
+                        push_results.append({"type": "prediction", "status": "success", "id": result.get("prediction_id")})
+                    except Exception as e:
+                        logger.error(f"Error pushing prediction: {str(e)}")
+                        push_results.append({"type": "prediction", "status": "error", "error": str(e)})
+
+            # Push results
+            if "results" in processed_data:
+                for res in processed_data["results"]:
+                    try:
+                        result = await lovable_client.push_result(**res)
+                        push_results.append({"type": "result", "status": "success", "id": result.get("result_id")})
+                    except Exception as e:
+                        logger.error(f"Error pushing result: {str(e)}")
+                        push_results.append({"type": "result", "status": "error", "error": str(e)})
+
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "file_size": len(content),
+            "processed_data": {
+                "events_count": len(processed_data.get("events", [])),
+                "riders_count": len(processed_data.get("riders", [])),
+                "predictions_count": len(processed_data.get("predictions", [])),
+                "results_count": len(processed_data.get("results", []))
+            },
+            "auto_push_enabled": auto_push,
+            "push_results": push_results if auto_push else None,
+            "needs_review": processed_data.get("needs_review", False),
+            "needs_manual_mapping": processed_data.get("needs_manual_mapping", False)
+        }
+
+    except Exception as e:
+        logger.error(f"Error ingesting historical data: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ingest-batch", response_model=Dict[str, Any])
+async def ingest_batch(
+    files: List[UploadFile] = File(...),
+    auto_push: bool = True,
+    x_api_key: Optional[str] = Header(None)
+):
+    """
+    Batch ingest multiple historical data files
+
+    Upload multiple files at once for processing.
+    Each file is processed independently and results are aggregated.
+
+    Args:
+        files: List of uploaded files
+        auto_push: If True, automatically push to Lovable after processing
+        x_api_key: API key for authentication
+
+    Returns:
+        Aggregated processing results
+    """
+    # Check API key if configured
+    if GPU_API_KEY and x_api_key != GPU_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        logger.info(f"Batch ingesting {len(files)} files")
+
+        results = []
+        total_events = 0
+        total_riders = 0
+        total_predictions = 0
+        total_results = 0
+
+        for file in files:
+            try:
+                # Process each file
+                result = await ingest_historical_data(file, auto_push, x_api_key)
+                results.append({
+                    "filename": file.filename,
+                    "status": "success",
+                    "details": result
+                })
+
+                # Aggregate counts
+                pd = result["processed_data"]
+                total_events += pd.get("events_count", 0)
+                total_riders += pd.get("riders_count", 0)
+                total_predictions += pd.get("predictions_count", 0)
+                total_results += pd.get("results_count", 0)
+
+            except Exception as e:
+                logger.error(f"Error processing {file.filename}: {str(e)}")
+                results.append({
+                    "filename": file.filename,
+                    "status": "error",
+                    "error": str(e)
+                })
+
+        return {
+            "status": "success",
+            "files_processed": len(files),
+            "totals": {
+                "events": total_events,
+                "riders": total_riders,
+                "predictions": total_predictions,
+                "results": total_results
+            },
+            "file_results": results
+        }
+
+    except Exception as e:
+        logger.error(f"Error in batch ingestion: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # RunPod serverless handler (if needed)
